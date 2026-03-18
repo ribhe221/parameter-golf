@@ -278,12 +278,15 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 # -----------------------------
-# POST-TRAINING QUANTIZATION
+# POST-TRAINING QUANTIZATION: NANOQUANT
 # -----------------------------
 #
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
+# NANOQUANT compresses each weight matrix W as W ≈ diag(s1) @ U @ V^T @ diag(s2),
+# where U ∈ {±1}^{n×r} and V ∈ {±1}^{m×r} are low-rank binary factors and
+# s1 ∈ R^n, s2 ∈ R^m are FP16 channelwise scales.
+# Storage: r(n+m)/8 bytes for packed bits + 2(n+m)*2 bytes for FP16 scales.
+# BPW formula: (r+16)(n+m)/(nm). Rank from BPW: r = floor(BPW*nm/(n+m) - 16).
+# Reference: NanoQuant (arxiv 2602.06694).
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -293,66 +296,112 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
-    ).split(",")
-    if pattern
-)
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
-INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+NANOQUANT_BPW = float(os.environ.get("NANOQUANT_BPW", "1.5"))
+NANOQUANT_ALT_ITERS = int(os.environ.get("NANOQUANT_ALT_ITERS", "100"))
+NANOQUANT_SCALE_ITERS = int(os.environ.get("NANOQUANT_SCALE_ITERS", "10"))
+NQ_KEEP_FLOAT_MAX_NUMEL = 65_536
+NQ_SCALE_DTYPE = torch.float16
+# Sensitive tensors (tied embedding / LM head) are kept at FP16; binary factorization
+# of the shared embedding degrades both input representations and output logits.
+NQ_SENSITIVE_PATTERNS = ("tok_emb", "lm_head")
+
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+def _compute_nq_rank(n: int, m: int, bpw: float) -> int:
+    r = int(bpw * n * m / (n + m) - 16)
+    return max(4, min(r, min(n, m)))
 
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
+def _pack_bits(x: Tensor) -> Tensor:
+    """Pack a ±1 (or bool) tensor into uint8, LSB-first, row-major."""
+    flat = (x.reshape(-1) > 0).to(torch.uint8)
+    pad = (-flat.numel()) % 8
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(pad)])
+    pw = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8, device=flat.device)
+    return flat.view(-1, 8).to(torch.uint8).mv(pw)
+
+
+def _unpack_bits(packed: Tensor, numel: int) -> Tensor:
+    """Unpack uint8 packed bits to a {-1, +1} float tensor of length numel."""
+    pw = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8, device=packed.device)
+    return ((packed.unsqueeze(-1) & pw) > 0).reshape(-1)[:numel].float() * 2.0 - 1.0
+
+
+def nanoquant_encode(W: Tensor, rank: int, device: torch.device) -> dict:
+    """Encode matrix W using low-rank binary factorization on `device`."""
+    W32 = W.to(device=device, dtype=torch.float32)
+    n, m = W32.shape
+
+    # Diagonal preconditioner: balance W by geometric mean of row/col norms.
+    row_norms = W32.norm(dim=1).clamp_min(1e-8)
+    col_norms = W32.norm(dim=0).clamp_min(1e-8)
+    d1 = row_norms.sqrt()   # (n,)
+    d2 = col_norms.sqrt()   # (m,)
+    W_bal = W32 / (d1[:, None] * d2[None, :])
+
+    # SVD-based initialization: sign of top-r left/right singular vectors.
+    try:
+        U_svd, _, Vh = torch.linalg.svd(W_bal, full_matrices=False)
+        U = torch.sign(U_svd[:, :rank])
+        V = torch.sign(Vh[:rank, :].T)
+    except Exception:
+        U = torch.sign(torch.randn(n, rank, device=device))
+        V = torch.sign(torch.randn(m, rank, device=device))
+    U[U == 0] = 1.0
+    V[V == 0] = 1.0
+
+    # Alternating binary optimization on the balanced matrix.
+    for _ in range(NANOQUANT_ALT_ITERS):
+        U = torch.sign(W_bal @ V);  U[U == 0] = 1.0  # noqa: E702
+        V = torch.sign(W_bal.T @ U); V[V == 0] = 1.0  # noqa: E702
+
+    # Scale fitting: minimize ||W - diag(s1) A diag(s2)||_F via alternating LS.
+    # A = U @ V^T; optimal s1[i] and s2[j] solved in closed form each iteration.
+    A = (U @ V.T).float()   # (n, m)
+    s1 = torch.ones(n, device=device)
+    s2 = torch.ones(m, device=device)
+    for _ in range(NANOQUANT_SCALE_ITERS):
+        As2 = A * s2[None, :]
+        denom = (As2 * As2).sum(1).clamp_min(1e-8)
+        s1 = ((W32 * As2).sum(1) / denom).clamp_min(0)
+        s1A = A * s1[:, None]
+        denom = (s1A * s1A).sum(0).clamp_min(1e-8)
+        s2 = ((W32 * s1A).sum(0) / denom).clamp_min(0)
+
+    return {
+        "U": _pack_bits(U).cpu(),
+        "V": _pack_bits(V).cpu(),
+        "s1": s1.cpu().to(NQ_SCALE_DTYPE).contiguous(),
+        "s2": s2.cpu().to(NQ_SCALE_DTYPE).contiguous(),
+        "n": n, "m": m, "r": rank,
+    }
+
+
+def nanoquant_decode(d: dict) -> Tensor:
+    """Reconstruct weight matrix from a nanoquant_encode dict."""
+    n, m, r = d["n"], d["m"], d["r"]
+    s1 = d["s1"].float()    # (n,)
+    s2 = d["s2"].float()    # (m,)
+    dev = s1.device
+    U = _unpack_bits(d["U"].to(dev), n * r).reshape(n, r)
+    V = _unpack_bits(d["V"].to(dev), m * r).reshape(m, r)
+    # W ≈ diag(s1) @ U @ V^T @ diag(s2)
+    return (s1[:, None] * (U @ V.T) * s2[None, :]).contiguous()
+
+
+def quantize_state_dict_nanoquant(state_dict: dict[str, Tensor], device: torch.device):
+    """Compress state_dict: NANOQUANT for large matrices, FP16 passthrough otherwise."""
+    nq: dict[str, dict] = {}
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
+    dtypes: dict[str, str] = {}
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors",
+         "baseline_tensor_bytes", "nq_payload_bytes"),
         0,
     )
 
@@ -365,59 +414,60 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         if not t.is_floating_point():
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            stats["nq_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+        # Control tensors, small tensors, or sensitive embedding/head: store as FP16.
+        is_ctrl = any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)
+        is_sensitive = any(p in name for p in NQ_SENSITIVE_PATTERNS)
+        if t.numel() <= NQ_KEEP_FLOAT_MAX_NUMEL or is_ctrl or is_sensitive:
+            if t.dtype in {torch.float32, torch.bfloat16}:
+                passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            passthrough[name] = t.to(NQ_SCALE_DTYPE).contiguous()
+            stats["nq_payload_bytes"] += tensor_nbytes(passthrough[name])
             continue
 
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        # Large 2-D float matrices: NANOQUANT binary factorization.
+        if t.ndim == 2:
+            stats["num_float_tensors"] += 1
+            rank = _compute_nq_rank(t.shape[0], t.shape[1], NANOQUANT_BPW)
+            enc = nanoquant_encode(t, rank, device)
+            nq[name] = enc
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            payload = (tensor_nbytes(enc["U"]) + tensor_nbytes(enc["V"])
+                       + tensor_nbytes(enc["s1"]) + tensor_nbytes(enc["s2"]))
+            stats["nq_payload_bytes"] += payload
+            continue
+
+        # Remaining floats (1-D vectors not caught above): FP16 passthrough.
+        if t.dtype in {torch.float32, torch.bfloat16}:
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+        passthrough[name] = t.to(NQ_SCALE_DTYPE).contiguous()
+        stats["nq_payload_bytes"] += tensor_nbytes(passthrough[name])
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
+        "__quant_format__": "nanoquant_v1",
+        "nanoquant": nq,
         "dtypes": dtypes,
         "passthrough": passthrough,
     }
-    if qmeta:
-        obj["qmeta"] = qmeta
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
+
+def dequantize_state_dict_nanoquant(obj: dict[str, object]) -> dict[str, Tensor]:
+    """Reconstruct state_dict from nanoquant_v1 compressed object."""
     out: dict[str, Tensor] = {}
-    qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
+    for name, d in obj["nanoquant"].items():
         dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
-            s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
-        else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+        out[name] = nanoquant_decode(d).to(dtype).contiguous()
     for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        orig = passthrough_orig_dtypes.get(name)
+        if isinstance(orig, str):
+            out_t = out_t.to(dtype=getattr(torch, orig)).contiguous()
         out[name] = out_t
     return out
 
@@ -1063,7 +1113,7 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # the NANOQUANT+zlib artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1073,30 +1123,30 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_nanoquant(base_model.state_dict(), device)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.nanoquant.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.nanoquant.ptz")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["nq_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model nanoquant+zlib: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['nq_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size nanoquant+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.nanoquant.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict_nanoquant(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1113,10 +1163,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_nanoquant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_nanoquant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
