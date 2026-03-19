@@ -69,11 +69,15 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    use_bigram_memory = bool(int(os.environ.get("USE_BIGRAM_MEMORY", "0")))
+    bigram_hash_rows = int(os.environ.get("BIGRAM_HASH_ROWS", 2048))
+    bigram_mem_dim = int(os.environ.get("BIGRAM_MEM_DIM", 32))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    bigram_mem_lr = float(os.environ.get("BIGRAM_MEM_LR", 0.08))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -645,6 +649,55 @@ class Block(nn.Module):
         return x
 
 
+BIGRAM_HASH_MULT_A = 36313
+BIGRAM_HASH_MULT_B = 27191
+
+
+def hash_bigram_ids(input_ids: Tensor, num_hash_rows: int) -> Tensor:
+    # Row 0 is reserved for the first token in each sequence.
+    hashed = torch.zeros_like(input_ids, dtype=torch.long)
+    if input_ids.size(1) <= 1:
+        return hashed
+    curr_ids = input_ids[:, 1:].to(torch.int64)
+    prev_ids = input_ids[:, :-1].to(torch.int64)
+    mixed = torch.bitwise_xor(curr_ids * BIGRAM_HASH_MULT_A, prev_ids * BIGRAM_HASH_MULT_B)
+    hashed[:, 1:] = mixed.remainder(num_hash_rows).add_(1)
+    return hashed
+
+
+class BigramMemory(nn.Module):
+    def __init__(
+        self,
+        model_dim: int,
+        num_hash_rows: int,
+        mem_dim: int,
+        gate_bias_init: float = -2.0,
+    ):
+        super().__init__()
+        if num_hash_rows <= 0:
+            raise ValueError(f"bigram_hash_rows must be positive, got {num_hash_rows}")
+        if mem_dim <= 0:
+            raise ValueError(f"bigram_mem_dim must be positive, got {mem_dim}")
+        self.num_hash_rows = num_hash_rows
+        self.table = nn.Embedding(num_hash_rows + 1, mem_dim)
+        self.proj = nn.Linear(mem_dim, model_dim, bias=False)
+        self.gate = nn.Linear(model_dim, 1)
+        self.alpha = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self._gate_bias_init = gate_bias_init
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.table.weight)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=self.table.embedding_dim ** -0.5)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, self._gate_bias_init)
+
+    def forward(self, input_ids: Tensor, x: Tensor) -> Tensor:
+        memory = self.proj(self.table(hash_bigram_ids(input_ids, self.num_hash_rows)))
+        gate = torch.sigmoid(self.gate(x).float()).to(dtype=x.dtype)
+        return x + self.alpha.to(dtype=x.dtype) * gate * memory.to(dtype=x.dtype)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -659,6 +712,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_bigram_memory: bool,
+        bigram_hash_rows: int,
+        bigram_mem_dim: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -684,6 +740,9 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        self.bigram_memory = (
+            BigramMemory(model_dim, bigram_hash_rows, bigram_mem_dim) if use_bigram_memory else None
+        )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -700,6 +759,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.bigram_memory is not None:
+            x = self.bigram_memory(input_ids, x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -835,6 +896,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_bigram_memory=args.use_bigram_memory,
+        bigram_hash_rows=args.bigram_hash_rows,
+        bigram_mem_dim=args.bigram_mem_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -883,6 +947,19 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.bigram_memory is not None:
+        optimizer_bigram = torch.optim.Adam(
+            [
+                {
+                    "params": list(base_model.bigram_memory.parameters()),
+                    "lr": args.bigram_mem_lr,
+                    "base_lr": args.bigram_mem_lr,
+                }
+            ],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+        )
+        optimizers.insert(1, optimizer_bigram)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -893,15 +970,24 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    bigram_params = (
+        sum(p.numel() for p in base_model.bigram_memory.parameters())
+        if base_model.bigram_memory is not None
+        else 0
+    )
     log0(f"model_params:{n_params}")
+    log0(f"bigram_memory:{args.use_bigram_memory} bigram_params:{bigram_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"bigram_mem_lr:{args.bigram_mem_lr if base_model.bigram_memory is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if base_model.bigram_memory is not None:
+        log0(f"bigram_memory_cfg:rows:{args.bigram_hash_rows} mem_dim:{args.bigram_mem_dim}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
